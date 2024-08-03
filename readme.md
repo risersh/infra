@@ -1,4 +1,4 @@
-# nvr.ai infra
+# risher.sh infra
 
 > Quickstart: `make setup infra/up services/up`
 

@@ -1,0 +1,178 @@
+services:
+  riser-infra-timescaledb:
+    container_name: riser-infra-timescaledb
+    platform: linux/amd64
+    image: timescale/timescaledb:latest-pg15
+    command: postgres -c shared_preload_libraries=timescaledb
+    networks:
+      riser:
+        ipv4_address: 10.67.0.10
+    ports:
+      - "5432:5432"
+    volumes:
+      - riser-infra-timescaledb:/var/lib/postgresql/data
+    environment:
+      - PGDATA=/var/lib/postgresql/data/timescaledb
+      - POSTGRES_DB=riser
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+  riser-infra-rabbitmq:
+    platform: "linux/arm64"
+    image: "rabbitmq:3-management"
+    container_name: "riser-infra-rabbitmq"
+    hostname: "rabbitmq.local"
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "SWQOKODSQALRPCLNMEQGFDSSDFFDDGSFDFSD"
+      RABBITMQ_DEFAULT_USER: "rabbitmq"
+      RABBITMQ_DEFAULT_PASS: "rabbitmq"
+      RABBITMQ_DEFAULT_VHOST: "/"
+    ports:
+      - "15672:15672"
+      - "5672:5672"
+    networks:
+      riser:
+        ipv4_address: 10.67.0.11
+  riser-infra-rtsp-server:
+    platform: linux/amd64
+    container_name: riser-infra-rtsp-server
+    image: aler9/rtsp-simple-server
+    environment:
+      RTSP_PROTOCOLS: "tcp"
+    ports:
+      - "18554:8554"
+      - "11935:1935"
+      - "18888:8888"
+    networks:
+      riser:
+        ipv4_address: 10.67.0.12
+  riser-infra-elasticsearch-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.1
+    volumes:
+      - riser-infra-elasticsearch-certs:/usr/share/elasticsearch/config/certs
+    user: "0"
+    command: >
+      bash -c '
+        if [ ! -f config/certs/ca.zip ]; then
+          echo "Creating CA";
+          bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
+          unzip config/certs/ca.zip -d config/certs;
+        fi;
+        if [ ! -f config/certs/certs.zip ]; then
+          echo "Creating certs";
+          echo -ne \
+          "instances:\n"\
+          "  - name: riser-infra-elasticsearch\n"\
+          "    dns:\n"\
+          "      - riser-infra-elasticsearch\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          > config/certs/instances.yml;
+          bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
+          unzip config/certs/certs.zip -d config/certs;
+        fi;
+        echo "Setting file permissions"
+        chown -R root:root config/certs;
+        find . -type d -exec chmod 750 \{\} \;;
+        find . -type f -exec chmod 640 \{\} \;;
+        echo "Waiting for Elasticsearch availability";
+        until curl -s --cacert config/certs/ca/ca.crt https://riser-infra-elasticsearch:9200 | grep -q "missing authentication credentials"; do sleep 30; done;
+        echo "Setting kibana_system password";
+        until curl -s -X POST --cacert config/certs/ca/ca.crt -u "elastic:elastic" -H "Content-Type: application/json" https://riser-infra-elasticsearch:9200/_security/user/kibana_system/_password -d "{\"password\":\"elastic\"}" | grep -q "^{}"; do sleep 10; done;
+        echo "All done!";
+      '
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "[ -f config/certs/riser-infra-elasticsearch/riser-infra-elasticsearch.crt ]",
+        ]
+      interval: 1s
+      timeout: 5s
+      retries: 120
+
+  riser-infra-elasticsearch:
+    container_name: riser-infra-elasticsearch
+    depends_on:
+      riser-infra-elasticsearch-setup:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.1
+    volumes:
+      - riser-infra-elasticsearch-certs:/usr/share/elasticsearch/config/certs
+      - riser-infra-elasticsearch-data:/usr/share/elasticsearch/data
+    ports:
+      - 9200:9200
+    environment:
+      - node.name=riser-infra-elasticsearch
+      - cluster.name=riser-infra-elasticsearch
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=elastic
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/riser-infra-elasticsearch/riser-infra-elasticsearch.key
+      - xpack.security.http.ssl.certificate=certs/riser-infra-elasticsearch/riser-infra-elasticsearch.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/riser-infra-elasticsearch/riser-infra-elasticsearch.key
+      - xpack.security.transport.ssl.certificate=certs/riser-infra-elasticsearch/riser-infra-elasticsearch.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.license.self_generated.type=basic
+    mem_limit: 1073741824 # 1024MB
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+
+  riser-infra-kibana:
+    container_name: riser-infra-kibana
+    depends_on:
+      riser-infra-elasticsearch:
+        condition: service_healthy
+    image: docker.elastic.co/kibana/kibana:8.14.1
+    volumes:
+      - riser-infra-elasticsearch-certs:/usr/share/kibana/config/certs
+      - riser-infra-kibana-data:/usr/share/kibana/data
+    ports:
+      - 5601:5601
+    environment:
+      - SERVERNAME=kibana
+      - ELASTICSEARCH_HOSTS=https://riser-infra-elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=elastic
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+    mem_limit: 1073741824 # 1024MB
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302 Found'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+
+volumes:
+  riser-infra-timescaledb:
+    driver: local
+  riser-infra-elasticsearch:
+    driver: local
+  riser-infra-elasticsearch-certs:
+    driver: local
+  riser-infra-elasticsearch-data:
+    driver: local
+  riser-infra-kibana-data:
+    driver: local
+networks:
+  riser:
+    external: true
